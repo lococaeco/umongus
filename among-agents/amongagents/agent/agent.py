@@ -54,8 +54,13 @@ class LLMAgent(Agent):
         self.system_prompt = system_prompt
         self.model = model
         self.temperature = 0.7
-        self.api_key = os.getenv("OPENROUTER_API_KEY")
-        self.api_url = "https://openrouter.ai/api/v1/chat/completions"
+        # LLM_API_URL / LLM_API_KEY override allow routing to a local OpenAI-compatible server (e.g. vLLM).
+        # LLM_API_URL can be a comma-separated list of endpoints for client-side load balancing
+        # across multiple independently-started vLLM servers.
+        self.api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "dummy"
+        raw_urls = os.getenv("LLM_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+        self.api_urls = [u.strip() for u in raw_urls.split(",") if u.strip()]
+        self.api_url = self.api_urls[0]
         self.summarization = "No thought process has been made."
         self.processed_memory = "No memory has been processed."
         self.chat_history = []
@@ -161,7 +166,7 @@ class LLMAgent(Agent):
 
     async def send_request(self, messages):
         """Send a POST request to OpenRouter API with the provided messages."""
-        headers = {"Authorization": f"Bearer {self.api_key}"}
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {
             "model": self.model,
             "messages": messages,
@@ -175,10 +180,16 @@ class LLMAgent(Agent):
         
         async with aiohttp.ClientSession() as session:
             for attempt in range(10):
+                # Round-robin across configured API URLs if multiple are given.
+                url = self.api_urls[attempt % len(self.api_urls)] if self.api_urls else self.api_url
                 try:
-                    async with session.post(self.api_url, headers=headers, data=json.dumps(payload)) as response:
+                    async with session.post(url, headers=headers, data=json.dumps(payload)) as response:
                         if response is None:
                             print(f"API request failed: response is None for {self.model}.")
+                            continue
+                        if response.status != 200:
+                            body = await response.text()
+                            print(f"[agent.py] API {response.status} for {self.model}: {body[:500]}")
                             continue
                         if response.status == 200:
                             data = await response.json()

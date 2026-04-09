@@ -1,59 +1,47 @@
-# Running AmongUs benchmark locally with vLLM (uv environment)
+# Running AmongUs locally on 8 GPUs with vLLM + uv
 
-This document describes how to stand up the AmongUs deception benchmark entirely
-on a single node using local GPUs and a self-hosted [vLLM](https://github.com/vllm-project/vllm)
-server instead of OpenRouter. Everything is set up inside a [uv](https://github.com/astral-sh/uv)
-virtual environment.
+This is a self-contained guide for running the AmongUs deception benchmark
+([upstream](https://github.com/7vik/AmongUs)) entirely on a local node, using
+a self-hosted [vLLM](https://github.com/vllm-project/vllm) OpenAI-compatible
+server instead of OpenRouter, with the environment managed by
+[`uv`](https://github.com/astral-sh/uv).
 
-## TL;DR measured numbers
+**Defaults in this repo assume 8× ~96GB GPUs and run Qwen2.5-32B-Instruct as
+8 data-parallel replicas** (one replica per GPU, maximum throughput). You can
+override every knob with environment variables — see below.
 
-On 1x RTX PRO 6000 Blackwell 96GB, `Qwen/Qwen2.5-32B-Instruct` (bf16, TP=1),
-running `main.py --num_games 5` (5 games concurrently via asyncio):
+The upstream code talks to `https://openrouter.ai/api/v1/chat/completions`.
+We add a small patch to
+[`among-agents/amongagents/agent/agent.py`](./among-agents/amongagents/agent/agent.py)
+so the same OpenAI-format client can talk to any local endpoint instead.
 
-| metric | value |
-| --- | --- |
-| wall time (5 games, concurrent) | ~1271s (~21 min) |
-| avg wall time per game | ~847s (~14 min, measured from first to last LLM call in that game) |
-| avg game length | 11.2 game steps |
-| avg LLM calls per game | 85.4 |
-| total LLM calls | 427 |
-| crewmates / impostors win rate | 3/5 vs 2/5 |
+---
 
-With `DP=8` on 8 GPUs you should see roughly an 8x throughput bump: ~2-3 min per
-game wall time when running multiple games in parallel.
+## 1. Prerequisites
 
+- NVIDIA GPUs (tested on 8× RTX PRO 6000 Blackwell 96GB)
+- `uv` installed and on `$PATH`
+  (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- Enough disk for HuggingFace model weights
 
-The upstream code ([github.com/7vik/AmongUs](https://github.com/7vik/AmongUs)) expects
-an OpenRouter API key and posts to `https://openrouter.ai/api/v1/chat/completions`.
-We add a minimal patch (`among-agents/amongagents/agent/agent.py`) so the same
-OpenAI-compatible client talks to a local vLLM server instead.
-
-## 0. Prerequisites
-
-- NVIDIA GPU(s) with recent drivers (tested on 8x RTX PRO 6000 Blackwell 96GB).
-- `uv` installed and available on `$PATH` (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
-- Enough disk to cache HuggingFace model weights.
-
-## 1. Clone and install
+## 2. Clone and install
 
 ```bash
-git clone https://github.com/lococaeco/umongus.git
+git clone git@github.com:lococaeco/umongus.git
 cd umongus
 
-# Create a Python 3.10 venv with uv
 uv venv --python 3.10
 source .venv/bin/activate
 
-# Core project deps
 uv pip install -r requirements.txt
-
-# Editable install of the "amongagents" subpackage
 uv pip install -e ./among-agents
-
-# vLLM (matching transformers version used by Qwen2.5 tokenizer)
-uv pip install vllm==0.11.0
-uv pip install "transformers==4.56.2"
+uv pip install vllm==0.11.0 "transformers==4.56.2"
 ```
+
+`transformers==4.56.2` is pinned because newer transformers drop the
+`TRANSFORMERS_CACHE` attribute that some vLLM/transformer-lens code paths
+still reference, and some older Qwen2 tokenizer classes break with
+transformers 5.x.
 
 Smoke test:
 
@@ -61,9 +49,7 @@ Smoke test:
 .venv/bin/python -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 ```
 
-## 2. Configure the environment file
-
-Create `.env` in the repo root:
+## 3. Configure `.env`
 
 ```bash
 cat > .env <<'EOF'
@@ -74,81 +60,70 @@ EOF
 ```
 
 - `LLM_API_URL` can be a **comma-separated list** of endpoints. The client
-  round-robins across them across retries, so pointing it at multiple vLLM
-  servers gives you client-side load balancing for free.
-- OpenRouter variables are kept around so the upstream code paths that read them
-  don't crash. Set a real `OPENROUTER_API_KEY` if you ever want to flip back to
-  the hosted path.
+  round-robins across them per retry, so pointing it at multiple independent
+  vLLM servers gives you client-side load balancing for free.
+- The `OPENROUTER_API_KEY` fallback is kept so upstream code paths that read
+  it don't crash. Set a real key if you ever want to flip back to hosted.
 
-## 3. Start a local vLLM server
+## 4. Start the vLLM server
 
-A helper script is provided: [`run_vllm_server.sh`](./run_vllm_server.sh).
-It reads configuration via environment variables:
-
-| var | default | meaning |
-| --- | --- | --- |
-| `MODEL` | `Qwen/Qwen2.5-32B-Instruct` | any HF id or local path |
-| `PORT` | `8000` | HTTP port |
-| `TP`   | `1` | tensor-parallel size (shards model across GPUs) |
-| `DP`   | `1` | data-parallel size (replicates model, adds throughput) |
-| `CUDA_VISIBLE_DEVICES` | `0` | which GPUs to expose |
-| `MAX_LEN` | `16384` | max context |
-| `GMEM` | `0.8` | gpu-memory-utilization |
-
-### Single-GPU run (smoke test)
+Default invocation — **uses all 8 GPUs**:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 MODEL=Qwen/Qwen2.5-32B-Instruct ./run_vllm_server.sh
+./run_vllm_server.sh
 ```
 
-Wait until `curl -s http://localhost:8000/v1/models` returns 200.
+That's equivalent to:
 
-### Using all 8 GPUs: two recipes
+```
+MODEL=Qwen/Qwen2.5-32B-Instruct
+PORT=8000
+TP=1
+DP=8
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+MAX_LEN=16384
+GMEM=0.85
+```
 
-The game has 7 concurrent agents per game, and `main.py --num_games N` runs
-games concurrently via `asyncio`, so throughput matters a lot.
+vLLM exposes a **single logical port** (8000); the 8 replicas are load-balanced
+internally. No client-side changes are needed.
 
-**Recipe A: 8 replicas of Qwen2.5-32B via vLLM data-parallel**
-(best if your model already fits comfortably on one GPU)
+Wait until the server is ready:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 DP=8 TP=1 ./run_vllm_server.sh
+curl -s http://localhost:8000/v1/models | head
 ```
 
-vLLM exposes a single logical port (8000) and internally load-balances across
-the 8 replicas. 1 client change needed? None — just keep the single
-`LLM_API_URL` in `.env`.
+### Other recipes (override with env vars)
 
-**Recipe B: Llama-3.3-70B with TP=2, DP=4** (matches the paper's impostor model)
+| Scenario | Command |
+| --- | --- |
+| Single-GPU smoke test (7B) | `CUDA_VISIBLE_DEVICES=0 DP=1 MODEL=Qwen/Qwen2.5-7B-Instruct ./run_vllm_server.sh` |
+| Llama-3.3-70B, 4 replicas TP=2 (uses 8 GPUs) | `MODEL=meta-llama/Llama-3.3-70B-Instruct TP=2 DP=4 ./run_vllm_server.sh` |
+| Two independent servers on different ports | see recipe C below |
+
+**Recipe C — different models per role**
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MODEL=meta-llama/Llama-3.3-70B-Instruct TP=2 DP=4 ./run_vllm_server.sh
+# Terminal 1 — crewmate model on GPUs 0-3
+CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=8000 \
+  MODEL=meta-llama/Llama-3.3-70B-Instruct TP=2 DP=2 ./run_vllm_server.sh
+
+# Terminal 2 — impostor model on GPUs 4-7
+CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=8001 \
+  MODEL=Qwen/Qwen2.5-32B-Instruct DP=4 ./run_vllm_server.sh
 ```
 
-70B in bf16 needs ~140GB of weights → 2 GPUs per replica, leaving room for
-4 replicas across 8 GPUs.
-
-**Recipe C: multiple independent servers on different ports**
-(useful if you want different models serving crewmate vs impostor)
-
-```bash
-# Terminal 1 – crewmate model
-CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=8000 MODEL=meta-llama/Llama-3.3-70B-Instruct TP=2 DP=2 ./run_vllm_server.sh
-
-# Terminal 2 – impostor model
-CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=8001 MODEL=Qwen/Qwen2.5-32B-Instruct DP=4 ./run_vllm_server.sh
-```
-
-Then in `.env`:
+Then point `.env` at both:
 
 ```
 LLM_API_URL=http://localhost:8000/v1/chat/completions,http://localhost:8001/v1/chat/completions
 ```
 
-Round-robin happens per retry. For per-role routing (crewmate → port 8000,
-impostor → port 8001) you would need a small additional patch to `agent.py`.
+(For strict per-role routing — crewmate always hits 8000, impostor always 8001
+— you'd need a small additional patch to `agent.py`. Out of scope here.)
 
-## 4. Run games
+## 5. Run games
 
 ```bash
 .venv/bin/python main.py \
@@ -160,19 +135,21 @@ impostor → port 8001) you would need a small additional patch to `agent.py`.
 
 Notes:
 
-- `--crewmate_llm` / `--impostor_llm` **must match the `--served-model-name`**
-  of the vLLM server (by default this is the HF id you passed as `MODEL`).
-- Logs land in `expt-logs/<date>_<name>/`:
-  - `agent-logs.json`        — pretty-printed full interactions
-  - `agent-logs-compact.json` — concatenated JSON objects, one per LLM call
-  - `summary.json`            — per-game winner + player assignments
-  - `experiment-details.txt`  — game config + commit hash snapshot
+- `--crewmate_llm` / `--impostor_llm` **must match the `served-model-name` of
+  the vLLM server**, which defaults to the HF id you passed as `MODEL`.
+- Games run concurrently via `asyncio.gather`, so bigger `--num_games` plus
+  `DP=8` gives you near-linear throughput scaling up to the number of
+  replicas.
+- Logs land under `expt-logs/<date>_<name>/`:
+  - `agent-logs.json`         — pretty-printed full interactions
+  - `agent-logs-compact.json` — concatenated JSON objects (one per LLM call)
+  - `summary.json`             — per-game winner + player assignments
+  - `experiment-details.txt`   — game config + commit hash snapshot
+- The "compact" file is **not** newline-delimited JSON; it is a stream of
+  concatenated objects. Use `scripts/game_stats.py` (or
+  `json.JSONDecoder().raw_decode` in a loop) to parse it.
 
-- Upstream's "compact" file is **not** newline-delimited JSON; it is a stream
-  of concatenated objects. Use the helper loader in `scripts/game_stats.py` to
-  parse it (or `json.JSONDecoder().raw_decode` in a loop).
-
-### Run 1 quick smoke-test game
+### Quick smoke test
 
 ```bash
 .venv/bin/python main.py --num_games 1 \
@@ -181,24 +158,46 @@ Notes:
     --name smoke
 ```
 
-## 5. Summarise results
+## 6. Summarise results
 
 ```bash
 .venv/bin/python scripts/game_stats.py expt-logs/<date>_<name>
 ```
 
-This prints per-game rows (winner, steps, wall-time, LLM-call count, impostors)
-and an aggregate (win rates, average steps, average wall time, total calls).
+Prints a per-game table (winner, steps, wall time, LLM-call count, impostors)
+plus an aggregate (win rates, averages, totals). Example output from a
+5-game batch with **one** GPU running Qwen2.5-32B (DP=1, TP=1):
 
-## 6. What we changed vs upstream
+```
+GAME       WINNER     STEPS  WALL(s)   LLM CALLS  IMPOSTORS
+-----------------------------------------------------------
+Game 1     Impostors  6      535.2     54         Player 1: red, Player 6: white
+Game 2     Impostors  11     1264.0    117        Player 3: yellow, Player 4: white
+Game 3     Crewmates  13     809.1     85         Player 2: black, Player 5: red
+Game 4     Crewmates  14     900.2     93         Player 1: orange, Player 5: blue
+Game 5     Crewmates  12     727.9     78         Player 5: black, Player 7: yellow
 
-- [`among-agents/amongagents/agent/agent.py`](./among-agents/amongagents/agent/agent.py)
-  - Read `LLM_API_URL` / `LLM_API_KEY` from env (with comma-separated multi-URL support).
-  - Added `Content-Type: application/json` header (vLLM rejects requests without it).
-  - Log non-200 response bodies so API errors stop being invisible.
-- [`run_vllm_server.sh`](./run_vllm_server.sh) — new helper.
-- [`scripts/game_stats.py`](./scripts/game_stats.py) — new stats reporter.
-- [`REPRODUCE.md`](./REPRODUCE.md) — this file.
+Aggregate over 5 games
+  Win rate: Crewmates 3/5, Impostors 2/5
+  Avg steps per game: 11.2
+  Avg wall time per game: 847.3s
+  Avg LLM calls per game: 85.4
+  Total LLM calls: 427
+```
 
-No game logic or prompts have been modified. Running against vLLM and running
-against OpenRouter should produce identical game behaviour for the same model.
+Total wall time for those 5 concurrent games was **~1271 s (~21 min)** on one
+GPU. With `DP=8` on all 8 GPUs you should see roughly an 8× throughput
+improvement (≈2–3 min wall time per game when running many games
+concurrently), subject to how much the agents serialise on each other.
+
+## 7. What changed vs upstream
+
+| File | Change |
+| --- | --- |
+| [`among-agents/amongagents/agent/agent.py`](./among-agents/amongagents/agent/agent.py) | Read `LLM_API_URL` / `LLM_API_KEY` from env, support comma-separated multi-URL round-robin, add `Content-Type: application/json` header (vLLM rejects requests without it), log non-200 response bodies |
+| [`run_vllm_server.sh`](./run_vllm_server.sh) | New helper, defaults to 8-way DP across all 8 GPUs |
+| [`scripts/game_stats.py`](./scripts/game_stats.py) | New per-game + aggregate stats reporter |
+| [`REPRODUCE.md`](./REPRODUCE.md) | This file |
+
+No game logic or prompts have been modified. Running against vLLM and against
+OpenRouter should produce identical game behaviour for the same model.

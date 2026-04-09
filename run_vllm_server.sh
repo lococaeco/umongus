@@ -1,24 +1,27 @@
 #!/usr/bin/env bash
 # Start a local OpenAI-compatible vLLM server for AmongUs game agents.
 #
+# Defaults are tuned for an 8x 96GB GPU node running Qwen/Qwen2.5-32B-Instruct
+# as 8 data-parallel replicas (one replica per GPU, maximum throughput).
+#
 # Environment variables:
-#   MODEL           HuggingFace model id or local path (default: Qwen/Qwen2.5-32B-Instruct)
-#   PORT            HTTP port to bind (default: 8000)
-#   TP              tensor-parallel size (default: 1)
-#   DP              data-parallel size / replicas (default: 1)
-#   GPU             legacy: CUDA_VISIBLE_DEVICES if that env is not already set
-#   MAX_LEN         max model context length (default: 16384)
-#   GMEM            gpu-memory-utilization (default: 0.8)
+#   MODEL           HuggingFace model id or local path   (default: Qwen/Qwen2.5-32B-Instruct)
+#   PORT            HTTP port to bind                    (default: 8000)
+#   TP              tensor-parallel size (shards a single replica across GPUs)  (default: 1)
+#   DP              data-parallel size / replicas                               (default: 8)
+#   CUDA_VISIBLE_DEVICES  GPUs to use   (default: 0,1,2,3,4,5,6,7)
+#   MAX_LEN         max model context length             (default: 16384)
+#   GMEM            gpu-memory-utilization               (default: 0.85)
 #
 # Examples:
-#   # Single 32B on GPU 0
-#   CUDA_VISIBLE_DEVICES=0 MODEL=Qwen/Qwen2.5-32B-Instruct ./run_vllm_server.sh
+#   # Default: 8 replicas of Qwen2.5-32B across all 8 GPUs
+#   ./run_vllm_server.sh
 #
-#   # 8 replicas of 32B, one per GPU (8x throughput)
-#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 DP=8 ./run_vllm_server.sh
+#   # Smaller model, single GPU (debug / smoke test)
+#   CUDA_VISIBLE_DEVICES=0 DP=1 MODEL=Qwen/Qwen2.5-7B-Instruct ./run_vllm_server.sh
 #
-#   # Llama-3.3-70B with TP=2, 4 replicas (uses 8 GPUs)
-#   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MODEL=meta-llama/Llama-3.3-70B-Instruct TP=2 DP=4 ./run_vllm_server.sh
+#   # Llama-3.3-70B with TP=2, 4 replicas (still uses all 8 GPUs)
+#   MODEL=meta-llama/Llama-3.3-70B-Instruct TP=2 DP=4 ./run_vllm_server.sh
 set -e
 cd "$(dirname "$0")"
 source .venv/bin/activate
@@ -26,12 +29,11 @@ source .venv/bin/activate
 MODEL=${MODEL:-Qwen/Qwen2.5-32B-Instruct}
 PORT=${PORT:-8000}
 TP=${TP:-1}
-DP=${DP:-1}
-GPU=${GPU:-0}
+DP=${DP:-8}
 MAX_LEN=${MAX_LEN:-16384}
-GMEM=${GMEM:-0.8}
+GMEM=${GMEM:-0.85}
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-$GPU}
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 
 echo "[run_vllm_server] MODEL=$MODEL PORT=$PORT TP=$TP DP=$DP CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 

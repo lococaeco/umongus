@@ -1,28 +1,11 @@
 # Running AmongUs locally on 8 GPUs with vLLM + uv
 
-This is a self-contained guide for running the AmongUs deception benchmark
-([upstream](https://github.com/7vik/AmongUs)) entirely on a local node, using
-a self-hosted [vLLM](https://github.com/vllm-project/vllm) OpenAI-compatible
-server instead of OpenRouter, with the environment managed by
-[`uv`](https://github.com/astral-sh/uv).
-
-**Defaults in this repo assume 8× ~96GB GPUs and run Qwen2.5-32B-Instruct as
-8 data-parallel replicas** (one replica per GPU, maximum throughput). You can
-override every knob with environment variables — see below.
-
-The upstream code talks to `https://openrouter.ai/api/v1/chat/completions`.
-We add a small patch to
-[`among-agents/amongagents/agent/agent.py`](./among-agents/amongagents/agent/agent.py)
-so the same OpenAI-format client can talk to any local endpoint instead.
-
 ---
 
 ## 1. Prerequisites
 
-- NVIDIA GPUs (tested on 8× RTX PRO 6000 Blackwell 96GB)
 - `uv` installed and on `$PATH`
   (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
-- Enough disk for HuggingFace model weights
 
 ## 2. Clone and install
 
@@ -37,13 +20,7 @@ uv pip install -r requirements.txt
 uv pip install -e ./among-agents
 uv pip install vllm==0.11.0 "transformers==4.56.2"
 ```
-
-`transformers==4.56.2` is pinned because newer transformers drop the
-`TRANSFORMERS_CACHE` attribute that some vLLM/transformer-lens code paths
-still reference, and some older Qwen2 tokenizer classes break with
-transformers 5.x.
-
-Smoke test:
+test:
 
 ```bash
 .venv/bin/python -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__, 'cuda', torch.cuda.is_available())"
@@ -66,7 +43,7 @@ EOF
   it don't crash. Set a real key if you ever want to flip back to hosted.
 
 ## 4. Start the vLLM server
-
+**Recipe A — same model per role**
 Default invocation — **uses all 8 GPUs**:
 
 ```bash
@@ -85,24 +62,7 @@ MAX_LEN=16384
 GMEM=0.85
 ```
 
-vLLM exposes a **single logical port** (8000); the 8 replicas are load-balanced
-internally. No client-side changes are needed.
-
-Wait until the server is ready:
-
-```bash
-curl -s http://localhost:8000/v1/models | head
-```
-
-### Other recipes (override with env vars)
-
-| Scenario | Command |
-| --- | --- |
-| Single-GPU smoke test (7B) | `CUDA_VISIBLE_DEVICES=0 DP=1 MODEL=Qwen/Qwen2.5-7B-Instruct ./run_vllm_server.sh` |
-| Llama-3.3-70B, 4 replicas TP=2 (uses 8 GPUs) | `MODEL=meta-llama/Llama-3.3-70B-Instruct TP=2 DP=4 ./run_vllm_server.sh` |
-| Two independent servers on different ports | see recipe C below |
-
-**Recipe C — different models per role**
+**Recipe B — different models per role**
 
 ```bash
 # Terminal 1 — crewmate model on GPUs 0-3
@@ -113,15 +73,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 PORT=8000 \
 CUDA_VISIBLE_DEVICES=4,5,6,7 PORT=8001 \
   MODEL=Qwen/Qwen2.5-32B-Instruct DP=4 ./run_vllm_server.sh
 ```
-
-Then point `.env` at both:
-
-```
-LLM_API_URL=http://localhost:8000/v1/chat/completions,http://localhost:8001/v1/chat/completions
-```
-
-(For strict per-role routing — crewmate always hits 8000, impostor always 8001
-— you'd need a small additional patch to `agent.py`. Out of scope here.)
 
 ## 5. Run games
 
